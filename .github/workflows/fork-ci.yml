@@ -1,0 +1,107 @@
+name: Fork CI
+
+# Alb11747/t3code remains the source and release repository. This workflow
+# batches its latest main every 30 minutes on the organization's Blacksmith.
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or commit in Alb11747/t3code to check
+        default: main
+        type: string
+
+concurrency:
+  group: fork-ci-${{ inputs.ref || 'main' }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  source:
+    name: Resolve source commit
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      run: ${{ steps.changes.outputs.run }}
+    steps:
+      - id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ inputs.ref || 'main' }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/Alb11747/t3code/commits/$SOURCE_REF" --jq .sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Source: [Alb11747/t3code@$sha](https://github.com/Alb11747/t3code/commit/$sha)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            checked=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=checked-source-$sha&per_page=1" --jq 'any(.artifacts[]; .expired | not)')
+            if [[ "$checked" == false ]]; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              baseline=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.expired | not) | select(.name | test("^checked-source-[0-9a-f]{40}$"))][0].name // empty')
+              echo "baseline=${baseline#checked-source-}" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - uses: actions/checkout@v6
+        if: steps.source.outputs.run == 'true' && steps.source.outputs.baseline != ''
+        with:
+          repository: Alb11747/t3code
+          ref: ${{ steps.source.outputs.sha }}
+          sparse-checkout: .github
+
+      - id: changes
+        env:
+          CHECK_SOURCE: ${{ steps.source.outputs.run }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          BASE_SHA: ${{ steps.source.outputs.baseline }}
+        run: |
+          set -euo pipefail
+          if [[ "$CHECK_SOURCE" != true ]]; then
+            exit 0
+          fi
+          if [[ -n "$BASE_SHA" ]]; then
+            git fetch --no-tags --depth=1 --filter=blob:none origin "$BASE_SHA"
+            # Compare the whole batch against tested code, not just the last commit.
+            if git diff --quiet --no-renames "$BASE_SHA" "$SOURCE_SHA" -- . \
+              ':(glob,exclude)**/*.md' ':(top,exclude)docs/**'; then
+              echo "Only documentation changed since $BASE_SHA; skipping checks." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            else
+              status=$?
+              if [[ "$status" != 1 ]]; then
+                exit "$status"
+              fi
+            fi
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+  checks:
+    name: Checks
+    needs: [source]
+    if: needs.source.outputs.run == 'true'
+    uses: ./.github/workflows/fork-checks.yml
+    with:
+      repository: Alb11747/t3code
+      ref: ${{ needs.source.outputs.sha }}
+
+  record:
+    name: Record successful source commit
+    needs: [source, checks]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - env:
+          SOURCE_SHA: ${{ needs.source.outputs.sha }}
+        run: printf '%s\n' "$SOURCE_SHA" > checked-source.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: checked-source-${{ needs.source.outputs.sha }}
+          path: checked-source.txt
+          retention-days: 90

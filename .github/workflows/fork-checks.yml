@@ -79,6 +79,10 @@ jobs:
       - name: Test
         run: vp run --parallel --concurrency-limit 4 --filter '!t3' --filter '!@t3tools/monorepo' --filter '!@t3tools/web' test
 
+      - name: Test fork release notes
+        if: hashFiles('fork/scripts/release-notes.test.cjs') != ''
+        run: node --test fork/scripts/release-notes.test.cjs
+
   # The web suite gets its own job, as in upstream's ci.yml, so the other
   # packages cannot starve its 30 s import hooks into timeouts.
   test_web:

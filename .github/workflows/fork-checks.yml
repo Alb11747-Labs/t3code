@@ -1,10 +1,12 @@
 name: Fork checks
 
 # The release gate from upstream's release.yml (quality, tests, sharded server
-# tests) for Alb11747-Labs. Jobs run on the Lazarus self-hosted runners
-# (label lazarus-linux) unless the `runner` input or the CHECKS_RUNNER
-# repository variable names another label, such as
-# blacksmith-8vcpu-ubuntu-2404 or ubuntu-24.04. Lazarus runners have no root,
+# tests) for Alb11747-Labs. Quality, tests and web tests run on the Lazarus
+# self-hosted runners (label lazarus-linux) unless the `runner` input or the
+# CHECKS_RUNNER repository variable names another label, such as
+# blacksmith-8vcpu-ubuntu-2404 or ubuntu-24.04. The server shards run on
+# GitHub-hosted runners (CHECKS_SERVER_RUNNER) beside them, because Lazarus
+# has the memory for only one job at a time. Lazarus runners have no root,
 # so jobs skip the apt steps there (their image has those packages) and use
 # the runners' persistent pnpm store instead of restoring the GitHub cache.
 # Called by fork-sync.yml before promoting a rebase and by fork-release.yml
@@ -131,7 +133,7 @@ jobs:
 
   test_server:
     name: Server tests ${{ matrix.shard }}
-    runs-on: ${{ inputs.runner || vars.CHECKS_RUNNER || 'lazarus-linux' }}
+    runs-on: ${{ inputs.runner || vars.CHECKS_SERVER_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false

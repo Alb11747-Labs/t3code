@@ -18,7 +18,7 @@ on:
         required: true
         type: string
       runner:
-        description: Runner label (empty uses the CHECKS_RUNNER variable, then lazarus-linux)
+        description: Runner label for every job (empty uses CHECKS_RUNNER, then lazarus-linux; server shards CHECKS_SERVER_RUNNER, then ubuntu-24.04)
         required: false
         type: string
 

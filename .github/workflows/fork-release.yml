@@ -1,10 +1,11 @@
 name: Fork release
 
 # Builds and publishes the fork's desktop apps (Linux x64 AppImage, Windows x64
-# installer) as a GitHub prerelease that installed copies pick up through the
-# in-app updater. Versions use upstream's nightly format
-# (<base>-nightly.<date>.<run>), so installs follow the nightly update channel,
-# and the build's update feed points at this repository (GITHUB_REPOSITORY).
+# installer) and CLI archives (Linux/Windows x64 and arm64, macOS arm64) as a
+# GitHub prerelease. Installed desktop copies pick it up through the in-app
+# updater. Versions extend the upstream nightly they're built on (see the
+# version step), so installs follow the nightly update channel, and the build's
+# update feed points at this repository (GITHUB_REPOSITORY).
 #
 # Upstream's release.yml also deploys services, publishes npm/AUR packages and
 # signs builds with upstream's credentials. It is disabled in this fork; this
@@ -17,10 +18,22 @@ on:
     paths-ignore:
       - "fork/*.md"
   workflow_dispatch:
+    inputs:
+      blocked_run_id:
+        description: Labs only - failed Fork release run whose budget gate blocked
+        type: string
+      dry_run:
+        description: Labs only - build and validate all assets without publishing
+        type: boolean
+        default: true
 
+# A newer push cancels the older run, even mid-build: agents often push several
+# fixes in a row, and building every one got the fork's Actions frozen
+# (October 2026).
 concurrency:
-  group: fork-release
-  cancel-in-progress: false
+  # Labs pushes skip releases and must not cancel a manual fallback build.
+  group: ${{ github.repository == 'Alb11747-Labs/t3code' && github.event_name != 'workflow_dispatch' && 'fork-release-ignored' || 'fork-release' }}
+  cancel-in-progress: true
 
 permissions:
   # The Windows job reads this run's artifact list to wait for the Linux CLI archive.
@@ -28,17 +41,110 @@ permissions:
   contents: read
 
 jobs:
+  # The fork-release-delay environment (repository settings) has a 15-minute
+  # wait timer, so a burst of pushes cancels itself here before any runner
+  # starts and only the last push builds. It is short because a fork push is a
+  # change wanted soon; upstream syncs settle in fork-sync.yml instead. Without
+  # the environment there is no wait.
+  #
+  # It also disables upstream workflows that a sync or push added: they need
+  # upstream's runners or credentials, or automate upstream's issues, and stay
+  # active until disabled. Every change to main passes through here.
+  settle:
+    name: Wait for pushes to settle
+    if: github.repository == 'Alb11747/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: fork-release-delay
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      release: ${{ steps.changes.outputs.release }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - run: echo "Releasing $GITHUB_SHA"
+
+      - name: Disable upstream workflows
+        run: |
+          set -euo pipefail
+          gh workflow list --all --limit 500 --json path,state --jq '.[] | select(.state == "active") | .path' |
+            while read -r path; do
+              case "$(basename "$path")" in
+                fork-* | release-desktop.yml) ;;
+                *) gh workflow disable "$(basename "$path")" ;;
+              esac
+            done
+
+      # paths-ignore compares against where the old and new history split, so
+      # folding a fork/*.md fix into an older commit still starts a release.
+      # Compare files with the newest published release instead; only tree
+      # objects are fetched.
+      - id: changes
+        name: Skip docs-only changes
+        run: |
+          set -euo pipefail
+          last=$(gh release list --exclude-drafts --limit 100 --json tagName,publishedAt \
+            --jq 'sort_by(.publishedAt) | last | .tagName // ""')
+          release=true
+          if [[ -n $last ]]; then
+            git init --quiet
+            git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+            git fetch --quiet --no-tags --depth=1 --filter=blob:none origin \
+              "refs/tags/$last:refs/last" "$GITHUB_SHA:refs/head"
+            # Assigned first so a failed diff fails the job instead of skipping.
+            changed=$(git diff --name-only --no-renames refs/last refs/head -- . ':(glob,exclude)fork/*.md')
+            if [[ -z $changed ]]; then
+              echo "Only fork/*.md changed since $last; skipping the release."
+              release=false
+            fi
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+  budget:
+    name: Job budget
+    needs: [settle]
+    if: needs.settle.outputs.release == 'true'
+    uses: ./.github/workflows/fork-budget.yml
+
+  fallback:
+    name: Verify budget fallback
+    if: github.repository == 'Alb11747-Labs/t3code' && github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.FORK_RELEASE_LINUX_RUNNER || 'blacksmith-2vcpu-ubuntu-2404' }}
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: fork/scripts
+      - id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BLOCKED_RUN_ID: ${{ inputs.blocked_run_id }}
+        run: node fork/scripts/release-fallback.cjs
+
   preflight:
     name: Preflight
-    runs-on: ubuntu-24.04
+    needs: [budget, fallback]
+    if: >-
+      always() && !cancelled() &&
+      (needs.budget.result == 'success' || needs.fallback.result == 'success')
+    runs-on: ${{ github.repository == 'Alb11747/t3code' && 'ubuntu-24.04' || vars.FORK_RELEASE_LINUX_RUNNER || 'blacksmith-2vcpu-ubuntu-2404' }}
     timeout-minutes: 10
     outputs:
       version: ${{ steps.meta.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
       name: ${{ steps.meta.outputs.name }}
+      sha: ${{ steps.meta.outputs.sha }}
     steps:
       - uses: actions/checkout@v6
         with:
+          repository: Alb11747/t3code
+          ref: ${{ needs.fallback.outputs.sha || github.sha }}
           fetch-depth: 0
           sparse-checkout: |
             /*
@@ -53,29 +159,51 @@ jobs:
             args:
               - --filter=@t3tools/scripts...
 
+      # Versions are the upstream nightly the fork is built on plus `.fork` or
+      # `.fork.<n>`; fork/scripts/release-version.cjs explains the numbering.
       - id: meta
         name: Resolve release version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: Alb11747/t3code
         run: |
           set -euo pipefail
-          node scripts/resolve-nightly-release.ts \
-            --date "$(date -u +%Y%m%d)" \
-            --run-number "$GITHUB_RUN_NUMBER" \
-            --sha "$GITHUB_SHA" \
-            --github-output
-          version="$(sed -n 's/^version=//p' "$GITHUB_OUTPUT" | tail -1)"
-          echo "name=T3 Code Fork $version (${GITHUB_SHA::12})" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags --quiet https://github.com/pingdotgg/t3code.git main
+          base=$(git merge-base HEAD FETCH_HEAD)
+          # The newest upstream nightly at or below the fork's upstream base.
+          # Annotated tags also list their peeled commit (`^{}`), which is the
+          # one present locally.
+          upstream_tag=""
+          while read -r sha ref; do
+            if git merge-base --is-ancestor "$sha" "$base" 2>/dev/null; then
+              upstream_tag=${ref#refs/tags/}
+              break
+            fi
+          done < <(git ls-remote --tags https://github.com/pingdotgg/t3code.git 'v*-nightly.*' \
+            | sed 's/\^{}$//' | sort -k2,2 -V -r)
+          [[ -n $upstream_tag ]] || { echo "::error::No upstream nightly found under $base."; exit 1; }
+          gh api --paginate --slurp "repos/$RELEASE_REPOSITORY/releases?per_page=100" \
+            > "$RUNNER_TEMP/fork-releases.json"
+          version=$(node fork/scripts/release-version.cjs \
+            "$RUNNER_TEMP/fork-releases.json" "$upstream_tag" "$RELEASE_REPOSITORY" FETCH_HEAD)
+          sha=$(git rev-parse HEAD)
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "name=T3 Code Fork $version (${sha::12})"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Write release notes
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_REPOSITORY: Alb11747/t3code
         run: |
           set -euo pipefail
           git fetch --no-tags --quiet https://github.com/pingdotgg/t3code.git main
-          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            > "$RUNNER_TEMP/fork-releases.json"
           node fork/scripts/release-notes.cjs \
-            "$RUNNER_TEMP/fork-releases.json" "$RELEASE_TAG" "$GITHUB_REPOSITORY" FETCH_HEAD \
+            "$RUNNER_TEMP/fork-releases.json" "$RELEASE_TAG" "$RELEASE_REPOSITORY" FETCH_HEAD \
             > release-notes.md
           cat release-notes.md
 
@@ -87,14 +215,22 @@ jobs:
 
   checks:
     name: Checks
+    needs: [preflight]
+    # A skipped alternate budget path is an ancestor of every build. Override
+    # GitHub's implicit success() while requiring all direct inputs to pass.
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     uses: ./.github/workflows/fork-checks.yml
     with:
-      ref: ${{ github.sha }}
+      repository: Alb11747/t3code
+      ref: ${{ needs.preflight.outputs.sha }}
 
+  # Builds wait for the checks so a failing commit doesn't also spend the
+  # desktop builds.
   build_bundle:
     name: Build JS bundle
-    needs: [preflight]
-    runs-on: ubuntu-24.04
+    needs: [preflight, checks]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.checks.result == 'success' }}
+    runs-on: ${{ github.repository == 'Alb11747/t3code' && 'ubuntu-24.04' || vars.FORK_RELEASE_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 45
     # T3 Connect needs upstream's Clerk/relay deployment. These optional
     # repository variables bake in public client values; without them the
@@ -107,6 +243,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          repository: Alb11747/t3code
+          ref: ${{ needs.preflight.outputs.sha }}
           sparse-checkout: |
             /*
             !/.repos/
@@ -125,7 +263,13 @@ jobs:
         run: node scripts/update-release-package-versions.ts "${{ needs.preflight.outputs.version }}"
 
       - name: Install browser secret helper build libraries
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+        run: |
+          # Lazarus runners are rootless; their image supplies build libraries.
+          if command -v sudo >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+          else
+            pkg-config --exists libsecret-1
+          fi
 
       - name: Build JS bundle
         run: vp run build:desktop
@@ -144,10 +288,13 @@ jobs:
   desktop_linux_x64:
     name: Desktop Linux x64
     needs: [preflight, build_bundle]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.build_bundle.result == 'success' }}
     uses: ./.github/workflows/release-desktop.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
-      ref: ${{ github.sha }}
+      repository: Alb11747/t3code
+      release_repository: Alb11747/t3code
+      ref: ${{ needs.preflight.outputs.sha }}
       release_channel: nightly
       relay_client_tracing: false
       clerk_publishable_key: ${{ vars.CLERK_PUBLISHABLE_KEY }}
@@ -155,7 +302,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ vars.CLERK_CLI_OAUTH_CLIENT_ID }}
       relay_url: ${{ vars.RELAY_URL }}
       label: Linux x64
-      runner: ubuntu-24.04
+      runner: ${{ github.repository == 'Alb11747/t3code' && 'ubuntu-24.04' || vars.FORK_RELEASE_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
       platform: linux
       target: AppImage
       arch: x64
@@ -166,10 +313,13 @@ jobs:
   desktop_win_x64:
     name: Desktop Windows x64
     needs: [preflight, build_bundle]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.build_bundle.result == 'success' }}
     uses: ./.github/workflows/release-desktop.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
-      ref: ${{ github.sha }}
+      repository: Alb11747/t3code
+      release_repository: Alb11747/t3code
+      ref: ${{ needs.preflight.outputs.sha }}
       release_channel: nightly
       relay_client_tracing: false
       clerk_publishable_key: ${{ vars.CLERK_PUBLISHABLE_KEY }}
@@ -177,7 +327,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ vars.CLERK_CLI_OAUTH_CLIENT_ID }}
       relay_url: ${{ vars.RELAY_URL }}
       label: Windows x64
-      runner: windows-2025
+      runner: ${{ github.repository == 'Alb11747/t3code' && 'windows-2025' || 'blacksmith-4vcpu-windows-2025' }}
       platform: win
       target: nsis
       arch: x64
@@ -185,14 +335,153 @@ jobs:
       resource_key: win32-x64
       cli_archive: true
 
+  # ARM remotes use the same fork release feed as x64. Package their CLI
+  # archives on native runners without building additional desktop installers.
+  cli_arm64:
+    name: CLI ${{ matrix.resource_key }}
+    needs: [preflight, build_bundle]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.build_bundle.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: mac
+            rust_target: aarch64-apple-darwin
+            resource_key: darwin-arm64
+          - runner: ${{ github.repository == 'Alb11747/t3code' && 'ubuntu-24.04-arm' || 'blacksmith-4vcpu-ubuntu-2404-arm' }}
+            platform: linux
+            rust_target: aarch64-unknown-linux-gnu
+            resource_key: linux-arm64
+          - runner: windows-11-arm
+            platform: win
+            rust_target: aarch64-pc-windows-msvc
+            resource_key: win32-arm64
+    defaults:
+      run:
+        shell: bash
+    env:
+      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ vars.CLERK_PUBLISHABLE_KEY }}
+      T3CODE_CLERK_JWT_TEMPLATE: ${{ vars.CLERK_JWT_TEMPLATE }}
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ vars.CLERK_CLI_OAUTH_CLIENT_ID }}
+      T3CODE_RELAY_URL: ${{ vars.RELAY_URL }}
+    steps:
+      # Match release-desktop's checkout: no credentials or submodule cleanup
+      # for the orphaned gitlinks in the excluded .repos tree.
+      - name: Checkout
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+          CHECKOUT_REF: ${{ needs.preflight.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/Alb11747/t3code.git"
+          git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout --detach FETCH_HEAD
+
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: ${{ matrix.platform != 'win' }}
+          run-install: false
+
+      - name: Install CLI dependencies
+        run: vp install --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ needs.preflight.outputs.version }}"
+
+      # Extract at apps/ to retain server/dist/client from the checked bundle.
+      - name: Download JS bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: js-bundle
+          path: apps
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install Spectre-mitigated MSVC libs
+        if: matrix.platform == 'win'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -products * -latest -property installationPath
+          $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $proc = Start-Process -FilePath $setupExe `
+            -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", `
+            "Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre", "--quiet", "--norestart" `
+            -Wait -PassThru -NoNewWindow
+          if ($null -eq $proc -or $proc.ExitCode -ne 0) {
+            $code = if ($null -ne $proc) { $proc.ExitCode } else { 1 }
+            Write-Error "Visual Studio Installer failed with exit code $code"
+            exit $code
+          }
+
+      - name: Build resource monitor
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target "${{ matrix.rust_target }}"
+
+      - name: Build CLI single-executable
+        env:
+          # Keep in step with SEA_NODE_VERSION in apps/server/vite.config.ts.
+          VP_NODE_VERSION: "26.8.2"
+          T3CODE_TELEMETRY_CHANNEL: dev
+        run: node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Stage resource monitor for the CLI archive
+        run: |
+          set -euo pipefail
+          binary_name="t3-resource-monitor"
+          if [[ "${{ matrix.platform }}" == "win" ]]; then
+            binary_name="${binary_name}.exe"
+          fi
+          target_dir="$RUNNER_TEMP/cli-resource-monitor/${{ matrix.resource_key }}"
+          mkdir -p "$target_dir"
+          cp "native/resource-monitor/target/${{ matrix.rust_target }}/release/${binary_name}" "$target_dir/$binary_name"
+
+      # The archive script signs macOS binaries ad hoc without credentials.
+      - name: Build CLI archive
+        run: |
+          node scripts/build-cli-archive.ts \
+            --platform "${{ matrix.platform }}" \
+            --arch arm64 \
+            --version "${{ needs.preflight.outputs.version }}" \
+            --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" \
+            --output-dir release-cli
+
+      - name: Smoke-test CLI archive
+        run: node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "${{ needs.preflight.outputs.version }}"
+
+      - name: Upload CLI archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: cli-${{ matrix.platform }}-arm64
+          path: release-cli/*
+          if-no-files-found: error
+          retention-days: 1
+
   release:
     name: Publish GitHub release
-    needs: [preflight, checks, desktop_linux_x64, desktop_win_x64]
-    runs-on: ubuntu-24.04
+    needs: [preflight, checks, desktop_linux_x64, desktop_win_x64, cli_arm64]
+    if: >-
+      !cancelled() && needs.preflight.result == 'success' && needs.checks.result == 'success' &&
+      needs.desktop_linux_x64.result == 'success' && needs.desktop_win_x64.result == 'success' &&
+      needs.cli_arm64.result == 'success'
+    runs-on: ${{ github.repository == 'Alb11747/t3code' && 'ubuntu-24.04' || vars.FORK_RELEASE_LINUX_RUNNER || 'blacksmith-2vcpu-ubuntu-2404' }}
     timeout-minutes: 20
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: fork/scripts
       - uses: actions/download-artifact@v8
         with:
           pattern: desktop-*
@@ -212,6 +501,8 @@ jobs:
       # The Windows job suffixes its updater manifest with the arch so x64 and
       # arm64 cannot collide; with x64 only, restore the name the updater reads.
       - name: Prepare release assets
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
           cd release-assets
@@ -219,30 +510,28 @@ jobs:
           for manifest in *-win-x64.yml; do
             mv "$manifest" "${manifest%-win-x64.yml}.yml"
           done
-          # Installed apps update only if both installers and both nightly
-          # feeds are attached, so refuse to publish without them.
-          for required in '*.AppImage' '*.exe' nightly.yml nightly-linux.yml; do
+          # Require both desktop installers/feeds and all five CLI archives
+          # before checksumming or publishing a release used by remote installs.
+          for required in '*.AppImage' '*.exe' nightly.yml nightly-linux.yml \
+            "t3-${RELEASE_VERSION}-linux-x64.tar.gz" \
+            "t3-${RELEASE_VERSION}-win32-x64.zip" \
+            "t3-${RELEASE_VERSION}-darwin-arm64.tar.gz" \
+            "t3-${RELEASE_VERSION}-linux-arm64.tar.gz" \
+            "t3-${RELEASE_VERSION}-win32-arm64.zip"; do
             compgen -G "$required" > /dev/null || { echo "Missing release asset: $required" >&2; exit 1; }
           done
           sha256sum t3-*.tar.gz t3-*.zip > SHA256SUMS
+          node -e 'require("../fork/scripts/publish-release.cjs").releaseAssets(".", process.env.RELEASE_VERSION)'
           ls -la
 
-      - uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.preflight.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          name: ${{ needs.preflight.outputs.name }}
-          body_path: release-notes.md
-          prerelease: true
-          make_latest: false
-          files: |
-            release-assets/*.AppImage
-            release-assets/*.deb
-            release-assets/*.exe
-            release-assets/*.blockmap
-            release-assets/*.yml
-            release-assets/*.tar.gz
-            release-assets/*.zip
-            release-assets/SHA256SUMS
-          fail_on_unmatched_files: false
-          token: ${{ github.token }}
+      - name: Publish release
+        if: github.repository == 'Alb11747/t3code' || !inputs.dry_run
+        env:
+          # The cross-repository credential is exposed only here, never to
+          # builds, dependency installation, or artifact download steps.
+          GH_TOKEN: ${{ github.repository == 'Alb11747/t3code' && github.token || secrets.FORK_RELEASE_TOKEN }}
+          GH_REPO: Alb11747/t3code
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_SHA: ${{ needs.preflight.outputs.sha }}
+          RELEASE_NAME: ${{ needs.preflight.outputs.name }}
+        run: node fork/scripts/publish-release.cjs

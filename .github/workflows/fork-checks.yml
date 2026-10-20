@@ -112,7 +112,12 @@ jobs:
           fi
 
       - name: Test
-        run: vp run --filter @t3tools/web test
+        run: |
+          # Upstream's release-link tests expect its repository, not the CI host.
+          if [[ ! -f fork/README.md ]]; then
+            export T3CODE_DESKTOP_UPDATE_REPOSITORY=pingdotgg/t3code
+          fi
+          vp run --filter @t3tools/web test
 
   test_server:
     name: Server tests ${{ matrix.shard }}

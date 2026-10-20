@@ -117,10 +117,17 @@ jobs:
     outputs:
       sha: ${{ steps.source.outputs.sha }}
     steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          sparse-checkout: fork/scripts
+      # Public fetch avoids checkout's credential cleanup traversing orphaned
+      # gitlinks, even when sparse checkout excludes the .repos directory.
+      - name: Checkout workflow helpers
+        run: |
+          set -euo pipefail
+          git init .
+          git config remote.origin.url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git sparse-checkout set --no-cone '/fork/scripts/'
+          git -c checkout.workers=0 checkout --force --detach FETCH_HEAD
+          git clean -ffdx
       - id: source
         env:
           GH_TOKEN: ${{ github.token }}
@@ -478,10 +485,15 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          sparse-checkout: fork/scripts
+      - name: Checkout workflow helpers
+        run: |
+          set -euo pipefail
+          git init .
+          git config remote.origin.url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git sparse-checkout set --no-cone '/fork/scripts/'
+          git -c checkout.workers=0 checkout --force --detach FETCH_HEAD
+          git clean -ffdx
       - uses: actions/download-artifact@v8
         with:
           pattern: desktop-*

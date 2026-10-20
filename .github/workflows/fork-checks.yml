@@ -1,7 +1,12 @@
 name: Fork checks
 
 # The release gate from upstream's release.yml (quality, tests, sharded server
-# tests) on Blacksmith runners in Alb11747-Labs.
+# tests) for Alb11747-Labs. Jobs run on the Lazarus self-hosted runners
+# (label lazarus-linux) unless the `runner` input or the CHECKS_RUNNER
+# repository variable names another label, such as
+# blacksmith-8vcpu-ubuntu-2404 or ubuntu-24.04. Lazarus runners have no root,
+# so jobs skip the apt steps there (their image has those packages) and use
+# the runners' persistent pnpm store instead of restoring the GitHub cache.
 # Called by fork-sync.yml before promoting a rebase and by fork-release.yml
 # before publishing.
 
@@ -14,6 +19,9 @@ on:
       ref:
         required: true
         type: string
+      runner:
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -21,7 +29,7 @@ permissions:
 jobs:
   quality:
     name: Quality
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ inputs.runner || vars.CHECKS_RUNNER || 'lazarus-linux' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -36,7 +44,7 @@ jobs:
       - uses: voidzero-dev/setup-vp@v1
         with:
           node-version-file: package.json
-          cache: true
+          cache: ${{ !startsWith(runner.name, 'lazarus-') }}
           run-install: true
 
       - name: Ensure Electron runtime is installed
@@ -50,7 +58,7 @@ jobs:
 
   test:
     name: Tests
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ inputs.runner || vars.CHECKS_RUNNER || 'lazarus-linux' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -65,15 +73,17 @@ jobs:
       - uses: voidzero-dev/setup-vp@v1
         with:
           node-version-file: package.json
-          cache: true
+          cache: ${{ !startsWith(runner.name, 'lazarus-') }}
           run-install: true
 
       - name: Ensure Electron runtime is installed
         run: vp run --filter @t3tools/desktop ensure:electron
 
       - uses: ./.github/actions/setup-apt-mirrors
+        if: ${{ !startsWith(runner.name, 'lazarus-') }}
 
       - name: Install browser secret helper build libraries
+        if: ${{ !startsWith(runner.name, 'lazarus-') }}
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config build-essential
 
       - name: Test
@@ -87,7 +97,7 @@ jobs:
   # packages cannot starve its 30 s import hooks into timeouts.
   test_web:
     name: Web tests
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ inputs.runner || vars.CHECKS_RUNNER || 'lazarus-linux' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -102,13 +112,13 @@ jobs:
       - uses: voidzero-dev/setup-vp@v1
         with:
           node-version-file: package.json
-          cache: true
+          cache: ${{ !startsWith(runner.name, 'lazarus-') }}
           run-install: true
 
       - name: Install Chromium for web browser tests
         run: |
           if [[ -f apps/web/node_modules/playwright/cli.js ]]; then
-            node apps/web/node_modules/playwright/cli.js install --with-deps --only-shell chromium
+            node apps/web/node_modules/playwright/cli.js install ${{ !startsWith(runner.name, 'lazarus-') && '--with-deps' || '' }} --only-shell chromium
           fi
 
       - name: Test
@@ -121,7 +131,7 @@ jobs:
 
   test_server:
     name: Server tests ${{ matrix.shard }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ inputs.runner || vars.CHECKS_RUNNER || 'lazarus-linux' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -140,13 +150,14 @@ jobs:
       - uses: voidzero-dev/setup-vp@v1
         with:
           node-version-file: package.json
-          cache: true
+          cache: ${{ !startsWith(runner.name, 'lazarus-') }}
           run-install: true
 
       - uses: ./.github/actions/setup-apt-mirrors
+        if: ${{ !startsWith(runner.name, 'lazarus-') }}
 
       - name: Install Chromium for server browser integration tests
-        run: node apps/server/node_modules/playwright-core/cli.js install --with-deps --only-shell chromium
+        run: node apps/server/node_modules/playwright-core/cli.js install ${{ !startsWith(runner.name, 'lazarus-') && '--with-deps' || '' }} --only-shell chromium
 
       - name: Test
         run: vp run --filter t3 test --shard ${{ matrix.shard }}/${{ strategy.job-total }}

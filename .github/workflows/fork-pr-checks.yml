@@ -8,6 +8,7 @@ name: Fork PR checks
 # Upstream PR branches start from upstream main and don't contain this file,
 # so pushes to them can't trigger it. Start it from main instead:
 #   gh workflow run fork-pr-checks.yml -R Alb11747-Labs/t3code -f ref=<branch-or-sha>
+# Add `-f runner=blacksmith-8vcpu-ubuntu-2404` to run off the Lazarus runners.
 
 on:
   workflow_dispatch:
@@ -15,6 +16,10 @@ on:
       ref:
         description: Branch or commit in Alb11747/t3code to check
         required: true
+        type: string
+      runner:
+        description: Runner label (empty uses the CHECKS_RUNNER variable, then lazarus-linux)
+        required: false
         type: string
 
 concurrency:
@@ -31,3 +36,4 @@ jobs:
     with:
       repository: Alb11747/t3code
       ref: ${{ inputs.ref }}
+      runner: ${{ inputs.runner }}

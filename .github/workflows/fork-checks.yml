@@ -79,9 +79,9 @@ jobs:
       - name: Test
         run: vp run --parallel --concurrency-limit 4 --filter '!t3' --filter '!@t3tools/monorepo' --filter '!@t3tools/web' test
 
-      - name: Test fork release notes
-        if: hashFiles('fork/scripts/release-notes.test.cjs') != ''
-        run: node --test fork/scripts/release-notes.test.cjs
+      - name: Test fork scripts
+        if: hashFiles('fork/scripts/*.test.cjs') != ''
+        run: node --test 'fork/scripts/*.test.cjs'
 
   # The web suite gets its own job, as in upstream's ci.yml, so the other
   # packages cannot starve its 30 s import hooks into timeouts.
@@ -104,6 +104,12 @@ jobs:
           node-version-file: package.json
           cache: true
           run-install: true
+
+      - name: Install Chromium for web browser tests
+        run: |
+          if [[ -f apps/web/node_modules/playwright/cli.js ]]; then
+            node apps/web/node_modules/playwright/cli.js install --with-deps --only-shell chromium
+          fi
 
       - name: Test
         run: vp run --filter @t3tools/web test

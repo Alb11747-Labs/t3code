@@ -1,0 +1,56 @@
+name: Lazarus runner smoke
+
+# Checks a Lazarus self-hosted runner's isolation without running project code:
+# no root, no Docker, no host, LAN or tailnet access, and working internet.
+# Run it after changing the runner image or host firewall:
+#   gh workflow run lazarus-runner-smoke.yml -R Alb11747-Labs/t3code
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner label
+        default: lazarus-linux
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Isolation
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: No root or Docker
+        # `! cmd` never trips bash -e, so each check fails explicitly.
+        run: |
+          id
+          fail() { echo "::error::$1"; exit 1; }
+          [[ $(id -u) != 0 ]] || fail "runs as root"
+          if command -v sudo; then fail "sudo is installed"; fi
+          if command -v docker; then fail "docker is installed"; fi
+          if touch /usr/local/probe 2>/dev/null; then fail "the root filesystem is writable"; fi
+
+      - name: Host, LAN and tailnet are unreachable
+        run: |
+          # The host's LAN address, the LAN router, this bridge's gateway and the host's tailnet address.
+          for url in http://10.0.0.50 http://10.0.0.50:3773 http://10.0.0.1 http://10.99.250.1 http://100.102.179.99:8317; do
+            if curl -s -o /dev/null -m 3 "$url"; then
+              echo "::error::$url is reachable"
+              exit 1
+            fi
+          done
+
+      - name: Internet works on HTTPS only
+        run: |
+          curl -fsS -o /dev/null -m 10 https://api.github.com
+          if timeout 5 bash -c '</dev/tcp/github.com/22'; then
+            echo "::error::SSH to github.com is reachable"
+            exit 1
+          fi
+
+      # A rejected job kills its runner, so this must never print on one.
+      - name: Always step
+        if: always()
+        run: echo "always step ran on $RUNNER_NAME"
